@@ -29,6 +29,7 @@
 #include <sys/system_properties.h>
 
 #include <async_safe/CHECK.h>
+#include <async_safe/log.h>
 #include <system_properties/prop_area.h>
 #include <system_properties/system_properties.h>
 
@@ -56,7 +57,22 @@ int __system_property_set_filename(const char*) {
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE
 int __system_property_area_init() {
   bool fsetxattr_fail = false;
-  return system_properties.AreaInit(PROP_DIRNAME, &fsetxattr_fail) && !fsetxattr_fail ? 0 : -1;
+  if (!system_properties.AreaInit(PROP_DIRNAME, &fsetxattr_fail)) {
+    // on old vendor kernels (e.g. 4.14) fsetxattr failures inside AreaInit
+    // can cascade: context_node Open() succeeds but sets fsetxattr_failed,
+    // which causes ContextsSerialized::Initialize to report open_failed and
+    // return false.  the property system may still be partially functional
+    // -- try to continue rather than letting init abort into recovery.
+    async_safe_format_log(ANDROID_LOG_ERROR, "libc",
+                          "property area init AreaInit failed, "
+                          "continuing anyway to avoid boot loop");
+  }
+  if (fsetxattr_fail) {
+    async_safe_format_log(ANDROID_LOG_WARN, "libc",
+                          "fsetxattr failed during property area init, "
+                          "continuing without SELinux property labels");
+  }
+  return 0;
 }
 
 __BIONIC_WEAK_FOR_NATIVE_BRIDGE

@@ -80,7 +80,17 @@ int epoll_pwait2_64(int fd, epoll_event* events, int max_events, const timespec*
     kts_ptr = &kts;
   }
 #endif
-  return __epoll_pwait2(fd, events, max_events, kts_ptr, ss, sizeof(*ss));
+  int result = __epoll_pwait2(fd, events, max_events, kts_ptr, ss, sizeof(*ss));
+  if (result == -1 && errno == ENOSYS) {
+    // Fall back to epoll_pwait for kernels that don't support epoll_pwait2 (< 5.11).
+    // The only loss is timeout precision (milliseconds instead of nanoseconds).
+    int timeout_ms = -1;
+    if (timeout) {
+      timeout_ms = static_cast<int>(timeout->tv_sec * 1000 + timeout->tv_nsec / 1000000);
+    }
+    result = __epoll_pwait(fd, events, max_events, timeout_ms, ss, sizeof(*ss));
+  }
+  return result;
 }
 
 int epoll_wait(int fd, struct epoll_event* events, int max_events, int timeout) {

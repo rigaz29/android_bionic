@@ -21,6 +21,11 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <errno.h>
+#include <stddef.h>
+#include <string.h>
 
 #include <async_safe/log.h>
 
@@ -41,8 +46,30 @@ static inline void _getentropy_fail(void) {
   async_safe_fatal("getentropy failed: %m");
 }
 
+// Disetel false bila kernel tidak mengenal MADV_WIPEONFORK (fitur itu masuk
+// Linux 4.14). Lihat _rs_allocate di bawah.
+static int g_arc4random_wipeonfork_works = 1;
+
 static inline void _rs_forkdetect(void) {
-  // Not needed thanks to the MADV_WIPEONFORK below.
+  // Normalnya tidak diperlukan: MADV_WIPEONFORK di _rs_allocate sudah menjamin
+  // pool di-nol-kan pada anak setelah fork.
+  //
+  // Pada kernel yang tidak mengenal MADV_WIPEONFORK, jaminan itu tidak ada, dan
+  // anak akan mewarisi keystream induknya -- keduanya menghasilkan urutan acak
+  // yang sama sampai reseed berikutnya. Karena itu di sana deteksi fork
+  // dikembalikan secara manual lewat perbandingan PID.
+  if (g_arc4random_wipeonfork_works) return;
+
+  static pid_t last_pid = 0;
+  pid_t pid = getpid();
+  if (pid == last_pid) return;
+  last_pid = pid;
+
+  // Tiru persis akibat MADV_WIPEONFORK: seluruh mapping (rs DAN rsx) di-nol-kan,
+  // sehingga _rs_stir_if_needed() melihat rs_count == 0 lalu memaksa _rs_stir()
+  // yang mengambil entropi baru dan me-rekey chacha.
+  if (rs != NULL) memset(rs, 0, sizeof(*rs));
+  if (rsx != NULL) memset(rsx, 0, sizeof(*rsx));
 }
 
 static inline int _rs_allocate(struct _rs** rsp, struct _rsx** rsxp) {
@@ -60,8 +87,23 @@ static inline int _rs_allocate(struct _rs** rsp, struct _rsx** rsxp) {
   }
 
   // Equivalent to OpenBSD's minherit(MAP_INHERIT_ZERO).
+  //
+  // MADV_WIPEONFORK baru ada sejak Linux 4.14. Pada kernel yang lebih tua
+  // madvise() menjawab EINVAL, dan meng-abort di sini membuat SETIAP proses
+  // gagal start -- arc4random dipakai saat inisialisasi hampir semua proses.
+  // Gejalanya terlihat pertama kali saat memasang ROM lewat recovery lama:
+  //   arc4random data MADV_WIPEONFORK failed: Invalid argument
+  //   Updater process ended with signal: 6
+  //
+  // Kegagalan itu ditoleransi, TAPI jaminannya tidak dibuang: _rs_forkdetect()
+  // di atas mengambil alih dengan deteksi berbasis PID. Kesalahan lain tetap
+  // fatal, karena itu menandakan hal yang benar-benar tak terduga.
   if (madvise(p, size, MADV_WIPEONFORK) == -1) {
-    async_safe_fatal("arc4random data MADV_WIPEONFORK failed: %m");
+    if (errno == EINVAL || errno == ENOSYS) {
+      g_arc4random_wipeonfork_works = 0;
+    } else {
+      async_safe_fatal("arc4random data MADV_WIPEONFORK failed: %m");
+    }
   }
 
   // Give the allocation a name to make tombstones more intelligible.
